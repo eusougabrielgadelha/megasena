@@ -158,7 +158,8 @@ def fmt_lembrete_dia(concurso:int, valor:float):
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Desativa o help padrão para não colidir com nosso !help:
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
