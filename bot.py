@@ -19,10 +19,15 @@ STATE_PATH = os.path.join(DATA_DIR, "state.json")
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; MegaBot/1.0; +https://github.com)",
     "Accept": "application/json, text/plain, */*",
-    "Referer": "https://loterias.caixa.gov.br/"
+    "Accept-Language": "pt-BR,pt;q=0.9",
+    "Referer": "https://loterias.caixa.gov.br/",
+    "Cache-Control": "no-cache",
 }
-
 HOME_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/home/ultimos-resultados"
+MODALIDADE_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/megasena"
+
+def log(msg: str):
+    print(f"{dt.datetime.now(TZ).isoformat(timespec='seconds')}: {msg}")
 
 def load_state()->Dict[str, Any]:
     if os.path.exists(STATE_PATH):
@@ -45,29 +50,55 @@ def brl(v):
 def parse_date_br(d: str)->dt.date:
     return dt.datetime.strptime(d, "%d/%m/%Y").date()
 
-async def fetch_home(session: aiohttp.ClientSession)->Dict[str, Any]:
-    for attempt in range(4):
+async def _fetch_json(session: aiohttp.ClientSession, url: str, retries: int = 3) -> Dict[str, Any]:
+    last_status = None
+    for attempt in range(retries):
         try:
-            async with session.get(HOME_URL, headers=DEFAULT_HEADERS, timeout=30) as resp:
-                if resp.status != 200:
-                    await asyncio.sleep(2**attempt)
-                    continue
-                return await resp.json(content_type=None)
-        except Exception:
-            await asyncio.sleep(2**attempt)
-    raise RuntimeError("Falha ao acessar home/ultimos-resultados")
+            async with session.get(url, headers=DEFAULT_HEADERS, timeout=30) as resp:
+                last_status = resp.status
+                if resp.status == 200:
+                    # alguns servidores retornam content-type estranho; ignora content_type
+                    return await resp.json(content_type=None)
+                await asyncio.sleep(1.5 * (attempt + 1))
+        except Exception as e:
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Falha ao acessar {url} (status={last_status})")
 
-def parse_megasena(home: Dict[str, Any])->Dict[str, Any]:
-    ms = home.get("megasena") or home.get("megaSena") or {}
+async def fetch_megasena(session: aiohttp.ClientSession)->Dict[str, Any]:
+    """
+    Tenta a home/ultimos-resultados e cai para /megasena se falhar.
+    Normaliza o dicionário de saída para o mesmo formato usado no resto do bot.
+    """
+    # 1) tenta a HOME
+    try:
+        home = await _fetch_json(session, HOME_URL)
+        ms = home.get("megasena") or home.get("megaSena") or {}
+        if ms:
+            return {
+                "acumulado": ms.get("acumulado", False),
+                "dataApuracao": ms.get("dataApuracao"),
+                "dataProximoConcurso": ms.get("dataProximoConcurso"),
+                "dezenas": [int(x) for x in (ms.get("dezenas") or [])],
+                "numeroDoConcurso": int(ms.get("numeroDoConcurso")) if ms.get("numeroDoConcurso") is not None else None,
+                "quantidadeGanhadores": ms.get("quantidadeGanhadores", 0),
+                "valorEstimadoProximoConcurso": float(ms.get("valorEstimadoProximoConcurso") or 0.0),
+                "valorPremio": float(ms.get("valorPremio") or 0.0),
+            }
+    except Exception as e:
+        log(f"[WARN] HOME falhou: {e}")
+
+    # 2) fallback: /megasena (último concurso da modalidade)
+    ms2 = await _fetch_json(session, MODALIDADE_URL)
+    dezenas = [int(x) for x in (ms2.get("listaDezenas") or ms2.get("dezenas") or [])]
     return {
-        "acumulado": ms.get("acumulado", False),
-        "dataApuracao": ms.get("dataApuracao"),
-        "dataProximoConcurso": ms.get("dataProximoConcurso"),
-        "dezenas": [int(x) for x in (ms.get("dezenas") or [])],
-        "numeroDoConcurso": int(ms.get("numeroDoConcurso")) if ms.get("numeroDoConcurso") is not None else None,
-        "quantidadeGanhadores": ms.get("quantidadeGanhadores", 0),
-        "valorEstimadoProximoConcurso": float(ms.get("valorEstimadoProximoConcurso") or 0.0),
-        "valorPremio": float(ms.get("valorPremio") or 0.0),
+        "acumulado": bool(ms2.get("acumulado")),
+        "dataApuracao": ms2.get("dataApuracao") or ms2.get("dataApuracaoStr"),
+        "dataProximoConcurso": ms2.get("dataProximoConcurso"),
+        "dezenas": dezenas,
+        "numeroDoConcurso": int(ms2.get("numeroDoConcurso")) if ms2.get("numeroDoConcurso") is not None else None,
+        "quantidadeGanhadores": ms2.get("quantidadeGanhadores") or ms2.get("quantidadeGanhadoresSena") or 0,
+        "valorEstimadoProximoConcurso": float(ms2.get("valorEstimadoProximoConcurso") or 0.0),
+        "valorPremio": float(ms2.get("valorPremio") or 0.0),
     }
 
 def load_history_df():
@@ -76,7 +107,7 @@ def load_history_df():
         try:
             return load_history_numbers_from_excel(path)
         except Exception as e:
-            print(f"[WARN] Falha lendo {path}: {e}")
+            log(f"[WARN] Falha lendo {path}: {e}")
     return None
 
 HISTORY_DF = load_history_df()
@@ -119,14 +150,13 @@ def fmt_resultados_message(ms: Dict[str, Any], bets: Optional[List[List[int]]]):
     data_apur = ms["dataApuracao"]
     dezenas = ms["dezenas"]
     qtd_ganh = ms["quantidadeGanhadores"]
-    acumulado = ms["acumulado"]
     valor_premio = ms["valorPremio"]
     prox_valor = ms["valorEstimadoProximoConcurso"]
 
     header = f"Esses foram os resultados do concurso **{concurso}** - **{data_apur}**"
     resultado = "Resultado: " + " - ".join(f"{d:02d}" for d in dezenas)
 
-    if qtd_ganh and qtd_ganh > 0:
+    if qtd_ganh and int(qtd_ganh) > 0:
         premio_line = f"Valor do prêmio (sena): {brl(valor_premio)}"
     else:
         premio_line = f"**Acumulou**. Valor estimado próximo: {brl(prox_valor)}"
@@ -158,13 +188,17 @@ def fmt_lembrete_dia(concurso:int, valor:float):
 
 intents = discord.Intents.default()
 intents.message_content = True
-# Desativa o help padrão para não colidir com nosso !help:
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
-    print(f"Logado como {bot.user} (ID {bot.user.id})")
+    log(f"Logado como {bot.user} (ID {bot.user.id})")
     check_feed_loop.start()
+
+# Mostra erro de comando no chat
+@bot.event
+async def on_command_error(ctx: commands.Context, error: Exception):
+    await ctx.reply(f"⚠️ Erro ao executar comando: `{error}`")
 
 @tasks.loop(seconds=SETTINGS.check_interval_seconds)
 async def check_feed_loop():
@@ -172,16 +206,22 @@ async def check_feed_loop():
     channels = st.get("channels", {})
     if not channels:
         return
-    async with aiohttp.ClientSession() as session:
-        home = await fetch_home(session)
-    ms = parse_megasena(home)
-    if not ms["numeroDoConcurso"]:
-        return
-    concurso = ms["numeroDoConcurso"]
-    data_prox = ms["dataProximoConcurso"]
-    valor_prox = ms["valorEstimadoProximoConcurso"]
+    try:
+        async with aiohttp.ClientSession() as session:
+            ms = await fetch_megasena(session)
+    except Exception as e:
+        log(f"[WARN] check_feed_loop: {e}")
+        return  # não derruba a task
 
-    if st.get("last_processed_concurso") != concurso and ms["dezenas"]:
+    if not ms.get("numeroDoConcurso"):
+        return
+
+    concurso = ms["numeroDoConcurso"]
+    data_prox = ms.get("dataProximoConcurso")
+    valor_prox = ms.get("valorEstimadoProximoConcurso", 0.0)
+
+    # resultado novo disponível
+    if st.get("last_processed_concurso") != concurso and ms.get("dezenas"):
         prior_bets = load_bets(concurso)
         msg1 = fmt_resultados_message(ms, prior_bets)
 
@@ -197,13 +237,14 @@ async def check_feed_loop():
                     await ch.send(msg1)
                     await ch.send(msg2)
                 except Exception as e:
-                    print(f"[WARN] Falha ao enviar em {channel_id}: {e}")
+                    log(f"[WARN] Falha ao enviar em {channel_id}: {e}")
 
         st["last_processed_concurso"] = concurso
         if prox_concurso in st.get("reminder_sent_for", []):
             st["reminder_sent_for"].remove(prox_concurso)
         save_state(st)
 
+    # lembrete no dia do sorteio
     try:
         if data_prox:
             prox_date = parse_date_br(data_prox)
@@ -217,11 +258,11 @@ async def check_feed_loop():
                         try:
                             await ch.send(msg3)
                         except Exception as e:
-                            print(f"[WARN] Falha ao enviar lembrete em {channel_id}: {e}")
+                            log(f"[WARN] Falha ao enviar lembrete em {channel_id}: {e}")
                 st.setdefault("reminder_sent_for", []).append(prox_concurso)
                 save_state(st)
     except Exception as e:
-        print(f"[WARN] lembrete: {e}")
+        log(f"[WARN] lembrete: {e}")
 
 @bot.command(name="programar")
 async def programar(ctx: commands.Context, canal_id: Optional[int] = None):
@@ -249,18 +290,15 @@ async def surpresinha(ctx: commands.Context):
     api_err = None
     try:
         async with aiohttp.ClientSession() as session:
-            home = await fetch_home(session)
-        ms = parse_megasena(home)
+            ms = await fetch_megasena(session)
     except Exception as e:
         api_err = str(e)
 
-    # Se a API respondeu, usa o concurso oficial; caso contrário, fallback
     if ms and ms.get("numeroDoConcurso"):
         concurso_atual = ms["numeroDoConcurso"] or 0
         proximo = concurso_atual + 1
         seed_suffix = ms.get("dataProximoConcurso") or ""
     else:
-        # fallback: usa o último processado no state + data de hoje como semente
         st = load_state()
         last = st.get("last_processed_concurso") or 0
         proximo = (last + 1) if last else 0
@@ -274,26 +312,23 @@ async def surpresinha(ctx: commands.Context):
     note = ""
     if api_err:
         note = (
-            "\n\n_(Obs.: não consegui consultar o feed da CAIXA agora; "
-            "gerei via fallback local. Tente novamente mais tarde para alinhar ao concurso oficial.)_"
-            f"\nDetalhe técnico: `{api_err}`"
+            "\n\n_(Obs.: não consegui consultar o feed agora; gerei via fallback local.)_ "
+            f"`{api_err}`"
         )
     await ctx.reply(header + body + note)
 
 @bot.command(name="proximo-jogo")
 async def proximo_jogo(ctx: commands.Context):
-    """Mostra o próximo concurso da Mega-Sena: número, data e valor estimado."""
+    """Mostra o próximo concurso: número, data e valor estimado."""
     try:
         async with aiohttp.ClientSession() as session:
-            home = await fetch_home(session)
-        ms = parse_megasena(home)
+            ms = await fetch_megasena(session)
 
         if ms.get("numeroDoConcurso") is not None:
             concurso_atual = ms["numeroDoConcurso"]
             proximo = concurso_atual + 1
             data_prox = ms.get("dataProximoConcurso") or "Não informado"
             valor_prox = ms.get("valorEstimadoProximoConcurso") or 0.0
-
             msg = (
                 f"**Próximo concurso:** **{proximo}**\n"
                 f"**Data do sorteio:** {data_prox}\n"
@@ -303,27 +338,20 @@ async def proximo_jogo(ctx: commands.Context):
             await ctx.reply(msg)
             return
 
-        # Se a API respondeu mas não trouxe número, cai no fallback
         raise RuntimeError("Resposta sem numeroDoConcurso")
 
     except Exception as e:
-        # Fallback: usa estado local
         st = load_state()
         last = st.get("last_processed_concurso") or 0
         proximo = last + 1 if last else "desconhecido"
-        note = (
-            "⚠️ Não consegui consultar o feed agora. "
-            "Mostrando estimativa local baseada no último concurso processado."
-        )
         msg = (
-            f"{note}\n"
-            f"**Próximo concurso:** **{proximo}**\n"
-            f"**Data do sorteio:** Não disponível no momento\n"
-            f"**Prêmio estimado:** Não disponível no momento\n"
+            "⚠️ Não consegui consultar o feed agora.\n"
+            f"**Próximo concurso (estimado):** **{proximo}**\n"
+            "**Data do sorteio:** Indisponível\n"
+            "**Prêmio estimado:** Indisponível\n"
             f"_Detalhe técnico: {e}_"
         )
         await ctx.reply(msg)
-
 
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
@@ -332,14 +360,13 @@ async def help_cmd(ctx: commands.Context):
         "`!programar [id_do_canal]` – Define onde o bot enviará as mensagens.\n"
         "`!cancelar` – Cancela os envios automáticos neste servidor.\n"
         "`!surpresinha` – Gera 10 jogos recomendados agora.\n"
-        "`!proximo-jogo` – Mostra o número do próximo concurso, data e prêmio estimado.\n"  # <= NOVO
+        "`!proximo-jogo` – Mostra o número do próximo concurso, data e prêmio estimado.\n"
         "\n**Fluxo automático**\n"
         "• Mensagem 1: Resultado do concurso e avaliação dos 10 jogos salvos.\n"
         "• Mensagem 2: 10 jogos para o próximo concurso.\n"
         "• Mensagem 3: Lembrete no dia do sorteio.\n"
     )
     await ctx.reply(txt)
-
 
 def main():
     bot.run(SETTINGS.token)
