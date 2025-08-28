@@ -3,11 +3,12 @@
 """
 Bot de Discord focado na Mega-Sena.
 
-Robustez contra 403:
-- Tenta a API oficial (HOME).
-- Fallback para a API da modalidade (/megasena).
-- Fallback 2 (novo): SCRAPING do site oficial com BeautifulSoup (sem proxy).
-- Fallback 3: cache local do último JSON válido (até 36h), para manter operação.
+Fontes de dados (ordem de tentativa):
+  1) API comunitária estável: https://loteriascaixa-api.herokuapp.com/api/megasena/latest
+  2) API oficial HOME:       https://servicebus2.caixa.gov.br/portaldeloterias/api/home/ultimos-resultados
+  3) API oficial modalidade: https://servicebus2.caixa.gov.br/portaldeloterias/api/megasena
+  4) Scraping do site oficial com BeautifulSoup (sem proxy)
+  5) Cache local do último JSON válido (até 36h)
 
 Fluxo automático:
 1) Resultado do concurso encerrado + avaliação dos 10 jogos salvos.
@@ -21,8 +22,9 @@ Comandos:
 !proximo-jogo
 !help
 
-Requisitos extras:
-- beautifulsoup4 (instale: `pip install beautifulsoup4`)
+Requisitos:
+- beautifulsoup4, aiohttp, discord.py, pandas (opcional), numpy (opcional), openpyxl (opcional)
+- Habilitar "Message Content Intent" no Developer Portal do Discord.
 """
 
 from __future__ import annotations
@@ -84,11 +86,10 @@ _env_cookie = os.environ.get("CAIXA_COOKIE")
 if _env_cookie:
     DEFAULT_HEADERS["Cookie"] = _env_cookie
 
-# Endpoints oficiais
+# Endpoints
+ALT_API_URL = "https://loteriascaixa-api.herokuapp.com/api/megasena/latest"  # nova API principal
 HOME_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/home/ultimos-resultados"
 MODALIDADE_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/megasena"
-
-# Página de scraping oficial (HTTPS para evitar redirects de 302/HTTP)
 SCRAPE_URL = "https://loterias.caixa.gov.br/wps/portal/loterias/landing/megasena"
 
 # -----------------------------------------------------------------------------
@@ -146,11 +147,12 @@ def parse_date_br(d: str) -> dt.date:
 # HTTP com retry/backoff e normalização de respostas
 # -----------------------------------------------------------------------------
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str, retries: int = 3) -> Dict[str, Any]:
+async def _fetch_json(session: aiohttp.ClientSession, url: str, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     last_status = None
+    hdrs = headers or DEFAULT_HEADERS
     for attempt in range(retries):
         try:
-            async with session.get(url, headers=DEFAULT_HEADERS, timeout=30) as resp:
+            async with session.get(url, headers=hdrs, timeout=30) as resp:
                 last_status = resp.status
                 if resp.status == 200:
                     return await resp.json(content_type=None)
@@ -184,8 +186,55 @@ def _normalize_modalidade(ms2: Dict[str, Any]) -> Dict[str, Any]:
         "valorPremio": float(ms2.get("valorPremio") or 0.0),
     }
 
+def _normalize_alt_api(js: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normaliza a resposta de https://loteriascaixa-api.herokuapp.com/api/megasena/latest
+    Exemplo de campos:
+      - concurso (int), data (DD/MM/AAAA)
+      - dezenas (lista de strings), dezenasOrdemSorteio
+      - acumulou (bool)
+      - proximoConcurso (int), dataProximoConcurso (DD/MM/AAAA)
+      - premiacoes: [{faixa:1, ganhadores:int, valorPremio:float}, ...]
+      - valorEstimadoProximoConcurso (float)
+    """
+    dezenas_strs = js.get("dezenas") or []
+    dezenas = [int(x) for x in dezenas_strs if str(x).isdigit()]
+    dezenas = sorted(dezenas)
+    concurso = js.get("concurso")
+    data = js.get("data")  # dd/mm/aaaa
+    prox_data = js.get("dataProximoConcurso")
+    acumulou = bool(js.get("acumulou", False))
+    valor_estimado = float(js.get("valorEstimadoProximoConcurso") or 0.0)
+
+    # faixa 1 = sena
+    qtd_ganh = 0
+    valor_premio = 0.0
+    for pr in js.get("premiacoes", []):
+        if pr.get("faixa") == 1:
+            try:
+                qtd_ganh = int(pr.get("ganhadores") or 0)
+            except Exception:
+                qtd_ganh = 0
+            try:
+                valor_premio = float(pr.get("valorPremio") or 0.0)
+            except Exception:
+                valor_premio = 0.0
+            break
+
+    out = {
+        "acumulado": acumulou,
+        "dataApuracao": data,
+        "dataProximoConcurso": prox_data,
+        "dezenas": dezenas,
+        "numeroDoConcurso": int(concurso) if concurso is not None else None,
+        "quantidadeGanhadores": qtd_ganh,
+        "valorEstimadoProximoConcurso": valor_estimado,
+        "valorPremio": valor_premio,
+    }
+    return out
+
 # -----------------------------------------------------------------------------
-# SCRAPING (fallback 2) — BeautifulSoup no site oficial
+# SCRAPING (fallback) — BeautifulSoup no site oficial
 # -----------------------------------------------------------------------------
 
 _NUM_RE = re.compile(r"\d+")
@@ -203,14 +252,10 @@ def _to_int_safe(s: str) -> Optional[int]:
             return None
 
 def _parse_currency_to_float(text: str) -> Optional[float]:
-    """
-    Converte 'R$ 12.345.678,90' -> 12345678.90
-    """
     m = _CURRENCY_RE.search(text or "")
     if not m:
         return None
     val = m.group(0)
-    # remove R$, espaços, separador milhar ".", troca vírgula por ponto
     val = val.replace("R$", "").strip()
     val = val.replace(".", "").replace(",", ".")
     try:
@@ -219,15 +264,7 @@ def _parse_currency_to_float(text: str) -> Optional[float]:
         return None
 
 async def fetch_via_scrape(session: aiohttp.ClientSession) -> Dict[str, Any]:
-    """
-    Baixa o HTML da landing oficial e extrai:
-    - dezenas (ul.numbers.megasena / ul.numbers.mega-sena / variações)
-    - número do concurso (texto "Concurso 2906" etc.)
-    - data de apuração (primeira data dd/mm/aaaa próxima do bloco de resultado)
-    - (melhor esforço) valor estimado do próximo concurso (texto contendo 'estimad')
-    """
     hdrs = DEFAULT_HEADERS.copy()
-    # Para HTML, aceitar text/html ajuda a passar por alguns filtros
     hdrs["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 
     async with session.get(SCRAPE_URL, headers=hdrs, timeout=30, allow_redirects=True) as resp:
@@ -237,88 +274,87 @@ async def fetch_via_scrape(session: aiohttp.ClientSession) -> Dict[str, Any]:
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) dezenas — tente múltiplos seletores robustos
     dezenas: List[int] = []
-    # Seletores comuns:
-    # ul class="numbers megasena", "numbers mega-sena", "numbers mega", etc
     ul_candidates = []
     ul_candidates += soup.select("ul.numbers.megasena")
     ul_candidates += soup.select("ul.numbers.mega-sena")
     ul_candidates += soup.select("ul.numbers.mega")
-    # fallback genérico: primeira UL com 6 LIs numéricos
     if not ul_candidates:
         for ul in soup.find_all("ul"):
             lis = ul.find_all("li")
             if 6 <= len(lis) <= 15 and all(_NUM_RE.search(li.get_text(strip=True) or "") for li in lis):
                 ul_candidates.append(ul)
                 break
-
     if ul_candidates:
         lis = ul_candidates[0].find_all("li")
         for li in lis:
             numtxt = (li.get_text(strip=True) or "").strip()
             if numtxt.isdigit():
                 dezenas.append(int(numtxt))
-        dezenas = sorted(set(dezenas))[:6]  # defensivo
+        dezenas = sorted(set(dezenas))[:6]
 
-    # 2) número do concurso — busca por "Concurso 2.906" etc
-    concurso: Optional[int] = None
     text_all = soup.get_text(separator=" ", strip=True)
+    concurso: Optional[int] = None
     m = _CONCURSO_RE.search(text_all)
     if m:
         concurso = _to_int_safe(m.group(1))
 
-    # 3) data de apuração — primeira data dd/mm/aaaa perto do topo
-    # (melhor esforço: usa a primeira data encontrada no documento)
     data_apuracao: Optional[str] = None
     mdate = _DATE_RE.search(text_all)
     if mdate:
         data_apuracao = mdate.group(1)
 
-    # 4) valor estimado próximo — procurar bloco com 'estimad'
     valor_prox: Optional[float] = None
     prox_data: Optional[str] = None
-    # tente localizar frases com "estimad" (estimado/estimativa), e extrair R$
     estim_nodes = [el for el in soup.find_all(text=re.compile("estimad", re.I))]
     if estim_nodes:
-        # procura a moeda no texto do próprio nó ou em pais próximos
         for node in estim_nodes:
             ctx_text = " ".join([node.strip(), node.parent.get_text(" ", strip=True) if node.parent else ""])
             money = _parse_currency_to_float(ctx_text)
             if money:
                 valor_prox = money
-                # procura data dd/mm/aaaa no mesmo contexto
                 mdate2 = _DATE_RE.search(ctx_text)
                 if mdate2:
                     prox_data = mdate2.group(1)
                 break
 
-    # Resultado consolidado (com defaults para campos não extraídos)
     out = {
-        "acumulado": False,  # desconhecido via HTML simples
+        "acumulado": False,
         "dataApuracao": data_apuracao,
         "dataProximoConcurso": prox_data,
         "dezenas": dezenas,
         "numeroDoConcurso": concurso,
-        "quantidadeGanhadores": 0,  # desconhecido aqui
+        "quantidadeGanhadores": 0,
         "valorEstimadoProximoConcurso": float(valor_prox or 0.0),
-        "valorPremio": 0.0,  # desconhecido aqui
+        "valorPremio": 0.0,
     }
     return out
 
 # -----------------------------------------------------------------------------
-# Função principal de obtenção resiliente
+# Função principal de obtenção resiliente (com NOVA API como 1ª opção)
 # -----------------------------------------------------------------------------
 
 async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
     Ordem de tentativa:
-      1) API HOME (/home/ultimos-resultados)
-      2) API MODALIDADE (/megasena)
-      3) SCRAPING do site oficial (BeautifulSoup)
-      4) Cache local (stale)
+      1) API Heroku (comunitária) /latest
+      2) API HOME (oficial)
+      3) API MODALIDADE (oficial)
+      4) Scraping do site oficial
+      5) Cache local
     """
-    # 1) HOME
+    # 1) Heroku API (menos sujeita a 403 e já normalizada)
+    try:
+        js = await _fetch_json(session, ALT_API_URL, headers={"Accept": "application/json", "User-Agent": DEFAULT_HEADERS["User-Agent"]})
+        out = _normalize_alt_api(js)
+        # Só salva se tiver base mínima
+        if out.get("numeroDoConcurso") or out.get("dezenas"):
+            _save_last_good(out)
+        return out
+    except Exception as e:
+        log(f"[WARN] ALT_API falhou: {e}")
+
+    # 2) HOME oficial
     try:
         home = await _fetch_json(session, HOME_URL)
         ms = home.get("megasena") or home.get("megaSena") or {}
@@ -329,7 +365,7 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     except Exception as e:
         log(f"[WARN] HOME falhou: {e}")
 
-    # 2) MODALIDADE
+    # 3) Modalidade oficial
     try:
         ms2 = await _fetch_json(session, MODALIDADE_URL)
         out = _normalize_modalidade(ms2)
@@ -338,23 +374,22 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     except Exception as e:
         log(f"[WARN] MODALIDADE falhou: {e}")
 
-    # 3) SCRAPING (sem proxy)
+    # 4) Scraping
     try:
         out = await fetch_via_scrape(session)
-        # Só salva se ao menos concurso ou dezenas foram obtidos (para não gravar lixo)
         if (out.get("numeroDoConcurso") is not None) or out.get("dezenas"):
             _save_last_good(out)
         return out
     except Exception as e:
         log(f"[WARN] SCRAPE falhou: {e}")
 
-    # 4) CACHE LOCAL
+    # 5) Cache local
     cached = _load_last_good()
     if cached:
         log("[INFO] usando cache local (stale)")
         return cached
 
-    raise RuntimeError("Sem acesso aos endpoints e sem cache local disponível")
+    raise RuntimeError("Sem acesso às fontes e sem cache local disponível")
 
 # -----------------------------------------------------------------------------
 # Dados históricos (opcional) e geração de jogos
@@ -523,7 +558,7 @@ async def check_feed_loop():
 
         st["last_processed_concurso"] = concurso
         if prox_concurso in st.get("reminder_sent_for", []):
-            st["reminder_sent_for"].remove(prox_concurso)
+            st.get("reminder_sent_for", []).remove(prox_concurso)
         save_state(st)
 
     # Lembrete no dia do sorteio
@@ -573,7 +608,7 @@ async def cancelar(ctx: commands.Context):
 async def surpresinha(ctx: commands.Context):
     """
     Gera 10 jogos do próximo concurso.
-    Se a API falhar, usa fallback local (último concurso processado + data atual como semente).
+    Se a consulta falhar por completo, usa fallback local (último concurso processado + data atual como semente).
     """
     ms = None
     api_err = None
@@ -601,7 +636,7 @@ async def surpresinha(ctx: commands.Context):
     note = ""
     if api_err:
         note = (
-            "\n\n_(Obs.: não consegui consultar o feed agora; gerei via fallback local.)_ "
+            "\n\n_(Obs.: não consegui consultar as fontes agora; gerei via fallback local.)_ "
             f"`{api_err}`"
         )
     await ctx.reply(header + body + note)
@@ -610,7 +645,7 @@ async def surpresinha(ctx: commands.Context):
 async def proximo_jogo(ctx: commands.Context):
     """
     Mostra o próximo concurso (número, data e prêmio estimado).
-    Usa endpoints oficiais e scraping; se tudo falhar, mostra estimativa local.
+    Usa a API nova e demais fallbacks; se tudo falhar, mostra estimativa local.
     """
     try:
         async with aiohttp.ClientSession() as session:
@@ -637,7 +672,7 @@ async def proximo_jogo(ctx: commands.Context):
         last = st.get("last_processed_concurso") or 0
         proximo = last + 1 if last else "desconhecido"
         msg = (
-            "⚠️ Não consegui consultar o site/endpoint agora.\n"
+            "⚠️ Não consegui consultar as fontes agora.\n"
             f"**Próximo concurso (estimado):** **{proximo}**\n"
             "**Data do sorteio:** Indisponível\n"
             "**Prêmio estimado:** Indisponível\n"
@@ -659,8 +694,7 @@ async def help_cmd(ctx: commands.Context):
         "• Mensagem 3: Lembrete no dia do sorteio.\n"
         "\n**Observações técnicas**\n"
         "• Requer **Message Content Intent** habilitado no Developer Portal do Discord.\n"
-        "• Para reduzir 403, usamos headers de navegador, scraping HTML e cache local de 36h.\n"
-        "• Opcional: defina `CAIXA_COOKIE` no ambiente se precisar enviar cookies na requisição.\n"
+        "• Ordem de fontes: API Heroku → APIs oficiais → scraping → cache local (36h).\n"
     )
     await ctx.reply(txt)
 
