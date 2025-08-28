@@ -2,19 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 Bot de Discord focado na Mega-Sena.
-- Consulta a API oficial da CAIXA com headers "de navegador" e fallback resiliente.
-- Salva em cache o último JSON válido em disco para operar mesmo sob 403/timeouts.
-- Gera 10 jogos usando o algoritmo do generator.py (anti-popularidade + baixa sobreposição).
-- Publica automaticamente:
-  1) Resultado do concurso encerrado + avaliação dos 10 jogos salvos.
-  2) 10 jogos para o próximo concurso.
-  3) Lembrete no dia do próximo sorteio.
-- Comandos:
-  !programar [id_do_canal]
-  !cancelar
-  !surpresinha
-  !proximo-jogo
-  !help
+
+Robustez contra 403:
+- Tenta a API oficial (HOME).
+- Fallback para a API da modalidade (/megasena).
+- Fallback 2 (novo): SCRAPING do site oficial com BeautifulSoup (sem proxy).
+- Fallback 3: cache local do último JSON válido (até 36h), para manter operação.
+
+Fluxo automático:
+1) Resultado do concurso encerrado + avaliação dos 10 jogos salvos.
+2) 10 jogos sugeridos para o próximo concurso.
+3) Lembrete no dia do próximo sorteio.
+
+Comandos:
+!programar [id_do_canal]
+!cancelar
+!surpresinha
+!proximo-jogo
+!help
+
+Requisitos extras:
+- beautifulsoup4 (instale: `pip install beautifulsoup4`)
 """
 
 from __future__ import annotations
@@ -22,13 +30,15 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import datetime as dt
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import random as _random
 
 import aiohttp
 import discord
 from discord.ext import commands, tasks
+from bs4 import BeautifulSoup
 from zoneinfo import ZoneInfo
 
 from config import load_settings
@@ -46,14 +56,12 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 
-# Arquivo de cache com o último JSON "bom" da Mega-Sena (para operar sob 403)
+# Cache do último JSON válido (para operar mesmo sob 403/timeouts)
 LAST_GOOD_PATH = os.path.join(DATA_DIR, "last_megasena.json")
-# Aceitamos cache "stale" por até 36 horas (cobre finais de semana e janelas longas de indisponibilidade)
-MAX_STALE_HOURS = 36
+MAX_STALE_HOURS = 36  # aceita cache "stale" por até 36h
 
-# Cabeçalhos alinhados com navegação real no site da CAIXA (reduz 403 em alguns WAFs)
+# Cabeçalhos "de navegador" ajudam a reduzir 403 em alguns WAFs
 DEFAULT_HEADERS = {
-    # UA realista de Chrome (ajude a passar por alguns WAFs)
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -66,46 +74,48 @@ DEFAULT_HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Connection": "keep-alive",
-    # Alguns WAFs checam esses cabeçalhos "sec-fetch"
     "Sec-Fetch-Site": "cross-site",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
 }
+# Opcional: permitir cookies customizados via variável de ambiente (se necessário)
+# Ex.: export CAIXA_COOKIE="JSESSIONID=...; outra=..."
+_env_cookie = os.environ.get("CAIXA_COOKIE")
+if _env_cookie:
+    DEFAULT_HEADERS["Cookie"] = _env_cookie
 
 # Endpoints oficiais
 HOME_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/home/ultimos-resultados"
 MODALIDADE_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/megasena"
+
+# Página de scraping oficial (HTTPS para evitar redirects de 302/HTTP)
+SCRAPE_URL = "https://loterias.caixa.gov.br/wps/portal/loterias/landing/megasena"
 
 # -----------------------------------------------------------------------------
 # Utilidades de log/estado/cache
 # -----------------------------------------------------------------------------
 
 def log(msg: str) -> None:
-    """Loga com timestamp no fuso configurado (aparece no PM2/journal)."""
     print(f"{dt.datetime.now(TZ).isoformat(timespec='seconds')}: {msg}")
 
 def load_state() -> Dict[str, Any]:
-    """Carrega estado persistido: canal por guild, último concurso processado, lembretes enviados."""
     if os.path.exists(STATE_PATH):
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     return {"channels": {}, "last_processed_concurso": None, "reminder_sent_for": []}
 
 def save_state(st: Dict[str, Any]) -> None:
-    """Salva estado em disco com write-then-rename para evitar corrupção."""
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_PATH)
 
 def _save_last_good(ms: Dict[str, Any]) -> None:
-    """Grava o último JSON válido (megasena) em disco para fallback."""
     payload = {"saved_at": dt.datetime.now(TZ).isoformat(), "megasena": ms}
     with open(LAST_GOOD_PATH, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 def _load_last_good() -> Optional[Dict[str, Any]]:
-    """Carrega o último JSON válido, respeitando janela de staleness."""
     if not os.path.exists(LAST_GOOD_PATH):
         return None
     try:
@@ -124,14 +134,12 @@ def _load_last_good() -> Optional[Dict[str, Any]]:
 # -----------------------------------------------------------------------------
 
 def brl(v) -> str:
-    """Formata float/Decimal para BRL simples (R$ 1.234,56)."""
     if v is None:
         return "R$ 0,00"
     s = f"{float(v):,.2f}"
     return "R$ " + s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 def parse_date_br(d: str) -> dt.date:
-    """Converte 'DD/MM/AAAA' para date."""
     return dt.datetime.strptime(d, "%d/%m/%Y").date()
 
 # -----------------------------------------------------------------------------
@@ -139,10 +147,6 @@ def parse_date_br(d: str) -> dt.date:
 # -----------------------------------------------------------------------------
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str, retries: int = 3) -> Dict[str, Any]:
-    """
-    Faz GET com headers realistas, retry + backoff com jitter.
-    Ignora content_type para JSON (alguns servidores setam incorretamente).
-    """
     last_status = None
     for attempt in range(retries):
         try:
@@ -156,7 +160,6 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, retries: int = 3
     raise RuntimeError(f"Falha ao acessar {url} (status={last_status})")
 
 def _normalize_home(ms: Dict[str, Any]) -> Dict[str, Any]:
-    """Normaliza o bloco 'megasena' da HOME para nosso formato interno."""
     return {
         "acumulado": ms.get("acumulado", False),
         "dataApuracao": ms.get("dataApuracao"),
@@ -169,29 +172,151 @@ def _normalize_home(ms: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _normalize_modalidade(ms2: Dict[str, Any]) -> Dict[str, Any]:
-    """Normaliza a resposta de /api/megasena para nosso formato interno."""
     dezenas = [int(x) for x in (ms2.get("listaDezenas") or ms2.get("dezenas") or [])]
     return {
         "acumulado": bool(ms2.get("acumulado")),
         "dataApuracao": ms2.get("dataApuracao") or ms2.get("dataApuracaoStr"),
         "dataProximoConcurso": ms2.get("dataProximoConcurso"),
-        "dezenas": mesmas(dezenas) if dezenas else [],
+        "dezenas": sorted(dezenas) if dezenas else [],
         "numeroDoConcurso": int(ms2.get("numeroDoConcurso")) if ms2.get("numeroDoConcurso") is not None else None,
         "quantidadeGanhadores": ms2.get("quantidadeGanhadores") or ms2.get("quantidadeGanhadoresSena") or 0,
         "valorEstimadoProximoConcurso": float(ms2.get("valorEstimadoProximoConcurso") or 0.0),
         "valorPremio": float(ms2.get("valorPremio") or 0.0),
     }
 
-def mesmas(nums: List[int]) -> List[int]:
-    """Apenas garante lista de inteiros ordenada (defensivo)."""
-    return sorted(int(x) for x in nums)
+# -----------------------------------------------------------------------------
+# SCRAPING (fallback 2) — BeautifulSoup no site oficial
+# -----------------------------------------------------------------------------
+
+_NUM_RE = re.compile(r"\d+")
+_CONCURSO_RE = re.compile(r"concurso\s*([\d\.]+)", re.I)
+_DATE_RE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
+_CURRENCY_RE = re.compile(r"R\$\s*[\d\.\,]+")
+
+def _to_int_safe(s: str) -> Optional[int]:
+    try:
+        return int(s)
+    except Exception:
+        try:
+            return int(s.replace(".", ""))  # 2.906 -> 2906
+        except Exception:
+            return None
+
+def _parse_currency_to_float(text: str) -> Optional[float]:
+    """
+    Converte 'R$ 12.345.678,90' -> 12345678.90
+    """
+    m = _CURRENCY_RE.search(text or "")
+    if not m:
+        return None
+    val = m.group(0)
+    # remove R$, espaços, separador milhar ".", troca vírgula por ponto
+    val = val.replace("R$", "").strip()
+    val = val.replace(".", "").replace(",", ".")
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+async def fetch_via_scrape(session: aiohttp.ClientSession) -> Dict[str, Any]:
+    """
+    Baixa o HTML da landing oficial e extrai:
+    - dezenas (ul.numbers.megasena / ul.numbers.mega-sena / variações)
+    - número do concurso (texto "Concurso 2906" etc.)
+    - data de apuração (primeira data dd/mm/aaaa próxima do bloco de resultado)
+    - (melhor esforço) valor estimado do próximo concurso (texto contendo 'estimad')
+    """
+    hdrs = DEFAULT_HEADERS.copy()
+    # Para HTML, aceitar text/html ajuda a passar por alguns filtros
+    hdrs["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+    async with session.get(SCRAPE_URL, headers=hdrs, timeout=30, allow_redirects=True) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Scrape falhou (status={resp.status})")
+        html = await resp.text()
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) dezenas — tente múltiplos seletores robustos
+    dezenas: List[int] = []
+    # Seletores comuns:
+    # ul class="numbers megasena", "numbers mega-sena", "numbers mega", etc
+    ul_candidates = []
+    ul_candidates += soup.select("ul.numbers.megasena")
+    ul_candidates += soup.select("ul.numbers.mega-sena")
+    ul_candidates += soup.select("ul.numbers.mega")
+    # fallback genérico: primeira UL com 6 LIs numéricos
+    if not ul_candidates:
+        for ul in soup.find_all("ul"):
+            lis = ul.find_all("li")
+            if 6 <= len(lis) <= 15 and all(_NUM_RE.search(li.get_text(strip=True) or "") for li in lis):
+                ul_candidates.append(ul)
+                break
+
+    if ul_candidates:
+        lis = ul_candidates[0].find_all("li")
+        for li in lis:
+            numtxt = (li.get_text(strip=True) or "").strip()
+            if numtxt.isdigit():
+                dezenas.append(int(numtxt))
+        dezenas = sorted(set(dezenas))[:6]  # defensivo
+
+    # 2) número do concurso — busca por "Concurso 2.906" etc
+    concurso: Optional[int] = None
+    text_all = soup.get_text(separator=" ", strip=True)
+    m = _CONCURSO_RE.search(text_all)
+    if m:
+        concurso = _to_int_safe(m.group(1))
+
+    # 3) data de apuração — primeira data dd/mm/aaaa perto do topo
+    # (melhor esforço: usa a primeira data encontrada no documento)
+    data_apuracao: Optional[str] = None
+    mdate = _DATE_RE.search(text_all)
+    if mdate:
+        data_apuracao = mdate.group(1)
+
+    # 4) valor estimado próximo — procurar bloco com 'estimad'
+    valor_prox: Optional[float] = None
+    prox_data: Optional[str] = None
+    # tente localizar frases com "estimad" (estimado/estimativa), e extrair R$
+    estim_nodes = [el for el in soup.find_all(text=re.compile("estimad", re.I))]
+    if estim_nodes:
+        # procura a moeda no texto do próprio nó ou em pais próximos
+        for node in estim_nodes:
+            ctx_text = " ".join([node.strip(), node.parent.get_text(" ", strip=True) if node.parent else ""])
+            money = _parse_currency_to_float(ctx_text)
+            if money:
+                valor_prox = money
+                # procura data dd/mm/aaaa no mesmo contexto
+                mdate2 = _DATE_RE.search(ctx_text)
+                if mdate2:
+                    prox_data = mdate2.group(1)
+                break
+
+    # Resultado consolidado (com defaults para campos não extraídos)
+    out = {
+        "acumulado": False,  # desconhecido via HTML simples
+        "dataApuracao": data_apuracao,
+        "dataProximoConcurso": prox_data,
+        "dezenas": dezenas,
+        "numeroDoConcurso": concurso,
+        "quantidadeGanhadores": 0,  # desconhecido aqui
+        "valorEstimadoProximoConcurso": float(valor_prox or 0.0),
+        "valorPremio": 0.0,  # desconhecido aqui
+    }
+    return out
+
+# -----------------------------------------------------------------------------
+# Função principal de obtenção resiliente
+# -----------------------------------------------------------------------------
 
 async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     """
-    Estratégia resiliente:
-      1) tenta HOME (/home/ultimos-resultados)
-      2) fallback para /api/megasena
-      3) se ambos falharem, usa o último JSON bom em disco (cache)
+    Ordem de tentativa:
+      1) API HOME (/home/ultimos-resultados)
+      2) API MODALIDADE (/megasena)
+      3) SCRAPING do site oficial (BeautifulSoup)
+      4) Cache local (stale)
     """
     # 1) HOME
     try:
@@ -204,7 +329,7 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     except Exception as e:
         log(f"[WARN] HOME falhou: {e}")
 
-    # 2) Modalidade direta
+    # 2) MODALIDADE
     try:
         ms2 = await _fetch_json(session, MODALIDADE_URL)
         out = _normalize_modalidade(ms2)
@@ -213,7 +338,17 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     except Exception as e:
         log(f"[WARN] MODALIDADE falhou: {e}")
 
-    # 3) Cache local (stale)
+    # 3) SCRAPING (sem proxy)
+    try:
+        out = await fetch_via_scrape(session)
+        # Só salva se ao menos concurso ou dezenas foram obtidos (para não gravar lixo)
+        if (out.get("numeroDoConcurso") is not None) or out.get("dezenas"):
+            _save_last_good(out)
+        return out
+    except Exception as e:
+        log(f"[WARN] SCRAPE falhou: {e}")
+
+    # 4) CACHE LOCAL
     cached = _load_last_good()
     if cached:
         log("[INFO] usando cache local (stale)")
@@ -226,7 +361,6 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 def load_history_df():
-    """Tenta carregar seu data.xlsx (opcional). Não é requisito para o bot."""
     path = SETTINGS.data_xlsx_path
     if os.path.exists(path):
         try:
@@ -238,7 +372,6 @@ def load_history_df():
 HISTORY_DF = load_history_df()
 
 def generate_bets_for_concurso(concurso: int, seed_suffix: str = "") -> List[List[int]]:
-    """Gera os 10 jogos com semente reprodutível baseada em concurso + data do próximo sorteio."""
     seed = f"MEGASENA-{concurso}-{seed_suffix}"
     gen = GameGenerator(seed=seed)
     return gen.generate(n_games=10)
@@ -262,7 +395,6 @@ def load_bets(concurso: int) -> Optional[List[List[int]]]:
 # -----------------------------------------------------------------------------
 
 def eval_hits(drawn: List[int], bets: List[List[int]]) -> Tuple[List[int], Optional[int], int]:
-    """Conta acertos por jogo; retorna (lista_acertos, indice_melhor_1based, max_acertos)."""
     drawn_set = set(drawn)
     hits_per_game = [len(drawn_set & set(b)) for b in bets]
     max_hits = max(hits_per_game) if hits_per_game else 0
@@ -270,7 +402,6 @@ def eval_hits(drawn: List[int], bets: List[List[int]]) -> Tuple[List[int], Optio
     return hits_per_game, best_index, max_hits
 
 def fmt_games(bets: List[List[int]]) -> str:
-    """Formata os 10 jogos em linhas legíveis."""
     lines = []
     for i, b in enumerate(bets, 1):
         nums = " - ".join(f"{n:02d}" for n in sorted(b))
@@ -278,16 +409,15 @@ def fmt_games(bets: List[List[int]]) -> str:
     return "\n".join(lines)
 
 def fmt_resultados_message(ms: Dict[str, Any], bets: Optional[List[List[int]]]) -> str:
-    """Mensagem 1: Resultado do concurso + avaliação dos jogos salvos (se houver)."""
-    concurso = ms["numeroDoConcurso"]
-    data_apur = ms["dataApuracao"]
+    concurso = ms.get("numeroDoConcurso")
+    data_apur = ms.get("dataApuracao")
     dezenas = ms.get("dezenas") or []
     qtd_ganh = ms.get("quantidadeGanhadores", 0)
     valor_premio = ms.get("valorPremio", 0.0)
     prox_valor = ms.get("valorEstimadoProximoConcurso", 0.0)
 
     header = f"Esses foram os resultados do concurso **{concurso}** - **{data_apur}**"
-    resultado = "Resultado: " + " - ".join(f"{d:02d}" for d in dezenas) if dezenas else "Resultado: indisponível"
+    resultado = "Resultado: " + (" - ".join(f"{d:02d}" for d in dezenas) if dezenas else "indisponível")
 
     if qtd_ganh and int(qtd_ganh) > 0:
         premio_line = f"Valor do prêmio (sena): {brl(valor_premio)}"
@@ -295,20 +425,26 @@ def fmt_resultados_message(ms: Dict[str, Any], bets: Optional[List[List[int]]]) 
         premio_line = f"**Acumulou**. Valor estimado próximo: {brl(prox_valor)}"
 
     if bets:
-        hits, best_idx, best = eval_hits(dezenas, bets) if dezenas else ([], None, 0)
-        jogos_feitos = f"Quantos jogos foram feitos: {len(bets)}"
-        acertos_list = "\n".join([f"- Jogo {i+1}: {h} acertos" for i, h in enumerate(hits)]) if hits else "- Sem avaliação (resultado indisponível)"
-        melhor = f"Esse foi o jogo com mais assertividade: Jogo {best_idx} - acertos: {best}" if best_idx else "Esse foi o jogo com mais assertividade: —"
-        body = f"{resultado}\n{jogos_feitos}\nQuantos números foram acertados em cada jogo:\n{acertos_list}\n{melhor}"
+        if dezenas:
+            hits, best_idx, best = eval_hits(dezenas, bets)
+            acertos_list = "\n".join([f"- Jogo {i+1}: {h} acertos" for i, h in enumerate(hits)])
+            melhor = f"Esse foi o jogo com mais assertividade: Jogo {best_idx} - acertos: {best}"
+        else:
+            acertos_list = "- Sem avaliação (resultado indisponível)"
+            melhor = "Esse foi o jogo com mais assertividade: —"
+        body = (
+            f"{resultado}\n"
+            f"Quantos jogos foram feitos: {len(bets)}\n"
+            f"Quantos números foram acertados em cada jogo:\n{acertos_list}\n{melhor}"
+        )
     else:
         body = resultado
 
     return f"{header}\n{premio_line}\n{body}"
 
 def fmt_proximo_message(ms: Dict[str, Any], bets: List[List[int]]) -> str:
-    """Mensagem 2: Próximo concurso + 10 jogos recomendados."""
     concurso_atual = ms.get("numeroDoConcurso")
-    proximo_concurso = (concurso_atual + 1) if concurso_atual is not None else "—"
+    proximo_concurso = (concurso_atual + 1) if isinstance(concurso_atual, int) else "—"
     data_prox = ms.get("dataProximoConcurso") or "Não informado"
     valor = ms.get("valorEstimadoProximoConcurso", 0.0)
     header = f"Para o próximo concurso **{proximo_concurso}** - **{data_prox}**"
@@ -317,7 +453,6 @@ def fmt_proximo_message(ms: Dict[str, Any], bets: List[List[int]]) -> str:
     return f"{header}\n{valor_line}\n{jogos}"
 
 def fmt_lembrete_dia(concurso: int, valor: float) -> str:
-    """Mensagem 3: Lembrete no dia do sorteio."""
     hoje = dt.datetime.now(TZ).strftime("%d/%m/%Y")
     return f"Hoje é o último dia para apostar no concurso **{concurso}** ({hoje}) com o valor estimado de {brl(valor)}"
 
@@ -326,10 +461,8 @@ def fmt_lembrete_dia(concurso: int, valor: float) -> str:
 # -----------------------------------------------------------------------------
 
 intents = discord.Intents.default()
-# NECESSÁRIO para comandos com prefixo "!" (habilite Message Content Intent no Dev Portal do Discord)
-intents.message_content = True
+intents.message_content = True  # habilite Message Content Intent no Dev Portal
 
-# help_command=None desabilita o help padrão para evitar conflito com nosso !help
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 @bot.event
@@ -339,36 +472,28 @@ async def on_ready():
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception):
-    """Mostra erros de comandos no canal para facilitar debug."""
     try:
         await ctx.reply(f"⚠️ Erro ao executar comando: `{error}`")
     except Exception:
         log(f"[WARN] Falha ao enviar erro para o canal: {error}")
 
 # -----------------------------------------------------------------------------
-# Tarefa em background: verificação periódica da Mega-Sena
+# Tarefa em background: verificação periódica
 # -----------------------------------------------------------------------------
 
 @tasks.loop(seconds=SETTINGS.check_interval_seconds)
 async def check_feed_loop():
-    """
-    - Busca dados da Mega-Sena (HOME -> fallback /megasena -> cache local).
-    - Se saiu resultado novo, publica resultado + avaliação e sugere 10 jogos para o próximo.
-    - No dia do próximo sorteio, envia lembrete.
-    - Nunca cai mesmo se a API falhar (apenas loga e retorna).
-    """
     st = load_state()
     channels = st.get("channels", {})
     if not channels:
         return
 
-    # Busca resiliente
     try:
         async with aiohttp.ClientSession() as session:
             ms = await fetch_megasena(session)
     except Exception as e:
         log(f"[WARN] check_feed_loop: {e}")
-        return  # mantém a task viva
+        return
 
     if not ms.get("numeroDoConcurso"):
         return
@@ -377,7 +502,7 @@ async def check_feed_loop():
     data_prox = ms.get("dataProximoConcurso")
     valor_prox = ms.get("valorEstimadoProximoConcurso", 0.0)
 
-    # Se detectou concurso novo com dezenas, dispare as mensagens 1 e 2
+    # Resultado novo
     if st.get("last_processed_concurso") != concurso and ms.get("dezenas"):
         prior_bets = load_bets(concurso)
         msg1 = fmt_resultados_message(ms, prior_bets)
@@ -387,7 +512,7 @@ async def check_feed_loop():
         save_bets(prox_concurso, bets_prox)
         msg2 = fmt_proximo_message(ms, bets_prox)
 
-        for guild_id, channel_id in channels.items():
+        for _, channel_id in channels.items():
             ch = bot.get_channel(int(channel_id))
             if ch:
                 try:
@@ -397,12 +522,11 @@ async def check_feed_loop():
                     log(f"[WARN] Falha ao enviar em {channel_id}: {e}")
 
         st["last_processed_concurso"] = concurso
-        # Permite novo lembrete para o próximo concurso
         if prox_concurso in st.get("reminder_sent_for", []):
             st["reminder_sent_for"].remove(prox_concurso)
         save_state(st)
 
-    # Lembrete no dia do sorteio do próximo concurso
+    # Lembrete no dia do sorteio
     try:
         if data_prox:
             prox_date = parse_date_br(data_prox)
@@ -410,7 +534,7 @@ async def check_feed_loop():
             prox_concurso = concurso + 1
             if today == prox_date and prox_concurso not in st.get("reminder_sent_for", []):
                 msg3 = fmt_lembrete_dia(prox_concurso, valor_prox)
-                for guild_id, channel_id in channels.items():
+                for _, channel_id in channels.items():
                     ch = bot.get_channel(int(channel_id))
                     if ch:
                         try:
@@ -428,11 +552,6 @@ async def check_feed_loop():
 
 @bot.command(name="programar")
 async def programar(ctx: commands.Context, canal_id: Optional[int] = None):
-    """
-    Define o canal onde o bot enviará as mensagens automáticas.
-    Uso: !programar  (usa o canal atual)
-         !programar 123456789012345678  (define por ID)
-    """
     if canal_id is None:
         canal_id = ctx.channel.id
     st = load_state()
@@ -442,7 +561,6 @@ async def programar(ctx: commands.Context, canal_id: Optional[int] = None):
 
 @bot.command(name="cancelar")
 async def cancelar(ctx: commands.Context):
-    """Cancela os envios automáticos para o servidor atual."""
     st = load_state()
     if str(ctx.guild.id) in st.get("channels", {}):
         st["channels"].pop(str(ctx.guild.id), None)
@@ -455,7 +573,7 @@ async def cancelar(ctx: commands.Context):
 async def surpresinha(ctx: commands.Context):
     """
     Gera 10 jogos do próximo concurso.
-    - Se a API estiver fora (403/timeout), usa fallback local (último concurso processado + data atual como semente).
+    Se a API falhar, usa fallback local (último concurso processado + data atual como semente).
     """
     ms = None
     api_err = None
@@ -491,8 +609,8 @@ async def surpresinha(ctx: commands.Context):
 @bot.command(name="proximo-jogo")
 async def proximo_jogo(ctx: commands.Context):
     """
-    Mostra o próximo concurso: número, data e prêmio estimado.
-    Usa os endpoints oficiais; se falhar, informa estimativa local baseada no último concurso processado.
+    Mostra o próximo concurso (número, data e prêmio estimado).
+    Usa endpoints oficiais e scraping; se tudo falhar, mostra estimativa local.
     """
     try:
         async with aiohttp.ClientSession() as session:
@@ -519,7 +637,7 @@ async def proximo_jogo(ctx: commands.Context):
         last = st.get("last_processed_concurso") or 0
         proximo = last + 1 if last else "desconhecido"
         msg = (
-            "⚠️ Não consegui consultar o feed agora.\n"
+            "⚠️ Não consegui consultar o site/endpoint agora.\n"
             f"**Próximo concurso (estimado):** **{proximo}**\n"
             "**Data do sorteio:** Indisponível\n"
             "**Prêmio estimado:** Indisponível\n"
@@ -529,7 +647,6 @@ async def proximo_jogo(ctx: commands.Context):
 
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
-    """Mostra o guia rápido de comandos e do fluxo automático."""
     txt = (
         "**Comandos disponíveis**\n"
         "`!programar [id_do_canal]` – Define onde o bot enviará as mensagens.\n"
@@ -541,8 +658,9 @@ async def help_cmd(ctx: commands.Context):
         "• Mensagem 2: 10 jogos para o próximo concurso.\n"
         "• Mensagem 3: Lembrete no dia do sorteio.\n"
         "\n**Observações técnicas**\n"
-        "• Este bot requer o **Message Content Intent** habilitado no Developer Portal do Discord.\n"
-        "• Os dados da CAIXA usam headers \"de navegador\" e fallback com cache local por até 36h.\n"
+        "• Requer **Message Content Intent** habilitado no Developer Portal do Discord.\n"
+        "• Para reduzir 403, usamos headers de navegador, scraping HTML e cache local de 36h.\n"
+        "• Opcional: defina `CAIXA_COOKIE` no ambiente se precisar enviar cookies na requisição.\n"
     )
     await ctx.reply(txt)
 
