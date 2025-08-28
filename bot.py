@@ -244,14 +244,86 @@ async def cancelar(ctx: commands.Context):
 
 @bot.command(name="surpresinha")
 async def surpresinha(ctx: commands.Context):
-    async with aiohttp.ClientSession() as session:
-        home = await fetch_home(session)
-    ms = parse_megasena(home)
-    concurso_atual = ms["numeroDoConcurso"] or 0
-    proximo = concurso_atual + 1
-    bets = generate_bets_for_concurso(proximo, seed_suffix=ms.get("dataProximoConcurso") or "")
+    """Gera 10 jogos do próximo concurso. Se a API falhar, usa fallback local."""
+    ms = None
+    api_err = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            home = await fetch_home(session)
+        ms = parse_megasena(home)
+    except Exception as e:
+        api_err = str(e)
+
+    # Se a API respondeu, usa o concurso oficial; caso contrário, fallback
+    if ms and ms.get("numeroDoConcurso"):
+        concurso_atual = ms["numeroDoConcurso"] or 0
+        proximo = concurso_atual + 1
+        seed_suffix = ms.get("dataProximoConcurso") or ""
+    else:
+        # fallback: usa o último processado no state + data de hoje como semente
+        st = load_state()
+        last = st.get("last_processed_concurso") or 0
+        proximo = (last + 1) if last else 0
+        seed_suffix = dt.datetime.now(TZ).strftime("%Y-%m-%d")
+
+    bets = generate_bets_for_concurso(proximo, seed_suffix=seed_suffix)
     save_bets(proximo, bets)
-    await ctx.reply(f"Esses são os jogos recomendados para o concurso **{proximo}**:\n{fmt_games(bets)}")
+
+    header = f"Esses são os jogos recomendados para o concurso **{proximo}**:\n"
+    body = fmt_games(bets)
+    note = ""
+    if api_err:
+        note = (
+            "\n\n_(Obs.: não consegui consultar o feed da CAIXA agora; "
+            "gerei via fallback local. Tente novamente mais tarde para alinhar ao concurso oficial.)_"
+            f"\nDetalhe técnico: `{api_err}`"
+        )
+    await ctx.reply(header + body + note)
+
+@bot.command(name="proximo-jogo")
+async def proximo_jogo(ctx: commands.Context):
+    """Mostra o próximo concurso da Mega-Sena: número, data e valor estimado."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            home = await fetch_home(session)
+        ms = parse_megasena(home)
+
+        if ms.get("numeroDoConcurso") is not None:
+            concurso_atual = ms["numeroDoConcurso"]
+            proximo = concurso_atual + 1
+            data_prox = ms.get("dataProximoConcurso") or "Não informado"
+            valor_prox = ms.get("valorEstimadoProximoConcurso") or 0.0
+
+            msg = (
+                f"**Próximo concurso:** **{proximo}**\n"
+                f"**Data do sorteio:** {data_prox}\n"
+                f"**Prêmio estimado:** {brl(valor_prox)}\n"
+                f"_Concurso atual (último apurado): {concurso_atual}_"
+            )
+            await ctx.reply(msg)
+            return
+
+        # Se a API respondeu mas não trouxe número, cai no fallback
+        raise RuntimeError("Resposta sem numeroDoConcurso")
+
+    except Exception as e:
+        # Fallback: usa estado local
+        st = load_state()
+        last = st.get("last_processed_concurso") or 0
+        proximo = last + 1 if last else "desconhecido"
+        note = (
+            "⚠️ Não consegui consultar o feed agora. "
+            "Mostrando estimativa local baseada no último concurso processado."
+        )
+        msg = (
+            f"{note}\n"
+            f"**Próximo concurso:** **{proximo}**\n"
+            f"**Data do sorteio:** Não disponível no momento\n"
+            f"**Prêmio estimado:** Não disponível no momento\n"
+            f"_Detalhe técnico: {e}_"
+        )
+        await ctx.reply(msg)
+
 
 @bot.command(name="help")
 async def help_cmd(ctx: commands.Context):
@@ -259,13 +331,15 @@ async def help_cmd(ctx: commands.Context):
         "**Comandos disponíveis**\n"
         "`!programar [id_do_canal]` – Define onde o bot enviará as mensagens.\n"
         "`!cancelar` – Cancela os envios automáticos neste servidor.\n"
-        "`!surpresinha` – Gera 10 jogos recomendados agora.\n\n"
-        "**Fluxo automático**\n"
+        "`!surpresinha` – Gera 10 jogos recomendados agora.\n"
+        "`!proximo-jogo` – Mostra o número do próximo concurso, data e prêmio estimado.\n"  # <= NOVO
+        "\n**Fluxo automático**\n"
         "• Mensagem 1: Resultado do concurso e avaliação dos 10 jogos salvos.\n"
         "• Mensagem 2: 10 jogos para o próximo concurso.\n"
         "• Mensagem 3: Lembrete no dia do sorteio.\n"
     )
     await ctx.reply(txt)
+
 
 def main():
     bot.run(SETTINGS.token)
