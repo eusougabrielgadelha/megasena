@@ -4,9 +4,12 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from zoneinfo import ZoneInfo
+import random as _random
 
 from config import load_settings
 from generator import GameGenerator, load_history_numbers_from_excel
+
+# =================== Config & Consts ===================
 
 SETTINGS = load_settings()
 TZ = ZoneInfo(SETTINGS.timezone)
@@ -17,14 +20,32 @@ os.makedirs(DATA_DIR, exist_ok=True)
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; MegaBot/1.0; +https://github.com)",
+    # UA realista (Chrome)
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "pt-BR,pt;q=0.9",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     "Referer": "https://loterias.caixa.gov.br/",
+    "Origin": "https://loterias.caixa.gov.br",
     "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 }
+
 HOME_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/home/ultimos-resultados"
 MODALIDADE_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/megasena"
+
+LAST_GOOD_PATH = os.path.join(DATA_DIR, "last_megasena.json")
+MAX_STALE_HOURS = 36  # aceita cache 'stale' por até 36h
+
+
+# =================== Utils ===================
 
 def log(msg: str):
     print(f"{dt.datetime.now(TZ).isoformat(timespec='seconds')}: {msg}")
@@ -41,6 +62,24 @@ def save_state(st: Dict[str, Any]):
         json.dump(st, f, ensure_ascii=False, indent=2)
     os.replace(tmp, STATE_PATH)
 
+def _save_last_good(ms: Dict[str, Any]) -> None:
+    payload = {"saved_at": dt.datetime.now(TZ).isoformat(), "megasena": ms}
+    with open(LAST_GOOD_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def _load_last_good() -> Optional[Dict[str, Any]]:
+    if not os.path.exists(LAST_GOOD_PATH):
+        return None
+    try:
+        with open(LAST_GOOD_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        saved_at = dt.datetime.fromisoformat(payload.get("saved_at"))
+        if (dt.datetime.now(TZ) - saved_at).total_seconds() <= MAX_STALE_HOURS * 3600:
+            return payload.get("megasena")
+    except Exception:
+        pass
+    return None
+
 def brl(v):
     if v is None:
         return "R$ 0,00"
@@ -50,6 +89,9 @@ def brl(v):
 def parse_date_br(d: str)->dt.date:
     return dt.datetime.strptime(d, "%d/%m/%Y").date()
 
+
+# =================== HTTP / Normalização ===================
+
 async def _fetch_json(session: aiohttp.ClientSession, url: str, retries: int = 3) -> Dict[str, Any]:
     last_status = None
     for attempt in range(retries):
@@ -57,38 +99,25 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str, retries: int = 3
             async with session.get(url, headers=DEFAULT_HEADERS, timeout=30) as resp:
                 last_status = resp.status
                 if resp.status == 200:
-                    # alguns servidores retornam content-type estranho; ignora content_type
                     return await resp.json(content_type=None)
-                await asyncio.sleep(1.5 * (attempt + 1))
-        except Exception as e:
-            await asyncio.sleep(1.5 * (attempt + 1))
+                await asyncio.sleep(1.0 + 0.5 * attempt + _random.random())
+        except Exception:
+            await asyncio.sleep(1.0 + 0.5 * attempt + _random.random())
     raise RuntimeError(f"Falha ao acessar {url} (status={last_status})")
 
-async def fetch_megasena(session: aiohttp.ClientSession)->Dict[str, Any]:
-    """
-    Tenta a home/ultimos-resultados e cai para /megasena se falhar.
-    Normaliza o dicionário de saída para o mesmo formato usado no resto do bot.
-    """
-    # 1) tenta a HOME
-    try:
-        home = await _fetch_json(session, HOME_URL)
-        ms = home.get("megasena") or home.get("megaSena") or {}
-        if ms:
-            return {
-                "acumulado": ms.get("acumulado", False),
-                "dataApuracao": ms.get("dataApuracao"),
-                "dataProximoConcurso": ms.get("dataProximoConcurso"),
-                "dezenas": [int(x) for x in (ms.get("dezenas") or [])],
-                "numeroDoConcurso": int(ms.get("numeroDoConcurso")) if ms.get("numeroDoConcurso") is not None else None,
-                "quantidadeGanhadores": ms.get("quantidadeGanhadores", 0),
-                "valorEstimadoProximoConcurso": float(ms.get("valorEstimadoProximoConcurso") or 0.0),
-                "valorPremio": float(ms.get("valorPremio") or 0.0),
-            }
-    except Exception as e:
-        log(f"[WARN] HOME falhou: {e}")
+def _normalize_home(ms: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "acumulado": ms.get("acumulado", False),
+        "dataApuracao": ms.get("dataApuracao"),
+        "dataProximoConcurso": ms.get("dataProximoConcurso"),
+        "dezenas": [int(x) for x in (ms.get("dezenas") or [])],
+        "numeroDoConcurso": int(ms.get("numeroDoConcurso")) if ms.get("numeroDoConcurso") is not None else None,
+        "quantidadeGanhadores": ms.get("quantidadeGanhadores", 0),
+        "valorEstimadoProximoConcurso": float(ms.get("valorEstimadoProximoConcurso") or 0.0),
+        "valorPremio": float(ms.get("valorPremio") or 0.0),
+    }
 
-    # 2) fallback: /megasena (último concurso da modalidade)
-    ms2 = await _fetch_json(session, MODALIDADE_URL)
+def _normalize_modalidade(ms2: Dict[str, Any]) -> Dict[str, Any]:
     dezenas = [int(x) for x in (ms2.get("listaDezenas") or ms2.get("dezenas") or [])]
     return {
         "acumulado": bool(ms2.get("acumulado")),
@@ -101,6 +130,39 @@ async def fetch_megasena(session: aiohttp.ClientSession)->Dict[str, Any]:
         "valorPremio": float(ms2.get("valorPremio") or 0.0),
     }
 
+async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
+    # 1) tenta HOME
+    try:
+        home = await _fetch_json(session, HOME_URL)
+        ms = home.get("megasena") or home.get("megaSena") or {}
+        if ms:
+            out = _normalize_home(ms)
+            _save_last_good(out)
+            return out
+    except Exception as e:
+        log(f"[WARN] HOME falhou: {e}")
+
+    # 2) fallback: /megasena
+    try:
+        ms2 = await _fetch_json(session, MODALIDADE_URL)
+        out = _normalize_modalidade(ms2)
+        _save_last_good(out)
+        return out
+    except Exception as e:
+        log(f"[WARN] MODALIDADE falhou: {e}")
+
+    # 3) último cache bom (stale)
+    cached = _load_last_good()
+    if cached:
+        log("[INFO] usando cache local (stale)")
+        return cached
+
+    # 4) nada feito
+    raise RuntimeError("Sem acesso aos endpoints e sem cache local disponível")
+
+
+# =================== História (opcional) ===================
+
 def load_history_df():
     path = SETTINGS.data_xlsx_path
     if os.path.exists(path):
@@ -111,6 +173,9 @@ def load_history_df():
     return None
 
 HISTORY_DF = load_history_df()
+
+
+# =================== Apostas & Mensagens ===================
 
 def generate_bets_for_concurso(concurso:int, seed_suffix:str="")->List[List[int]]:
     seed = f"MEGASENA-{concurso}-{seed_suffix}"
@@ -186,8 +251,11 @@ def fmt_lembrete_dia(concurso:int, valor:float):
     hoje = dt.datetime.now(TZ).strftime("%d/%m/%Y")
     return f"Hoje é o último dia para apostar no concurso **{concurso}** ({hoje}) com o valor estimado de {brl(valor)}"
 
+
+# =================== Discord Bot ===================
+
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # ative Message Content Intent no Developer Portal
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 @bot.event
@@ -195,7 +263,6 @@ async def on_ready():
     log(f"Logado como {bot.user} (ID {bot.user.id})")
     check_feed_loop.start()
 
-# Mostra erro de comando no chat
 @bot.event
 async def on_command_error(ctx: commands.Context, error: Exception):
     await ctx.reply(f"⚠️ Erro ao executar comando: `{error}`")
