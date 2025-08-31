@@ -11,20 +11,17 @@ Fontes de dados (ordem de tentativa):
   5) Cache local do último JSON válido (até 36h)
 
 Fluxo automático:
-1) Resultado do concurso encerrado + avaliação dos 10 jogos salvos.
-2) 10 jogos sugeridos para o próximo concurso.
+1) Resultado do concurso encerrado + avaliação dos jogos salvos.
+2) Jogos sugeridos para o próximo concurso.
 3) Lembrete no dia do próximo sorteio.
 
 Comandos:
 !programar [id_do_canal]
 !cancelar
-!surpresinha [novos] [balanced] [n=10] [shuffle=0|1]
+!surpresinha [novos] [balanced] [n=10] [shuffle=0|1] [perfil=alto|misto|historico] [min_high=2]
+             [sum_target=...] [sum_weight=...] [bucket_weight=...]
 !proximo-jogo
 !help
-
-Requisitos:
-- beautifulsoup4, aiohttp, discord.py, pandas (opcional), numpy (opcional), openpyxl (opcional)
-- Habilitar "Message Content Intent" no Developer Portal do Discord.
 """
 
 from __future__ import annotations
@@ -394,7 +391,13 @@ def generate_bets_for_concurso(
     n_games: int = 10,
     balanced: bool = False,
     shuffle: bool = True,
-    novos: bool = False
+    novos: bool = False,
+    # --- novos knobs para dialogar com generator.py ---
+    profile: str = None,
+    min_high: Optional[int] = None,
+    sum_target: Optional[float] = None,
+    sum_weight: Optional[float] = None,
+    bucket_weight: Optional[float] = None,
 ) -> List[List[int]]:
     """
     Gera apostas para um concurso.
@@ -402,13 +405,27 @@ def generate_bets_for_concurso(
     - balanced: tenta cobertura uniforme (quando possível)
     - shuffle: embaralha a ordem de apresentação das dezenas
     - novos: se True, usa um 'sal' temporal aleatório para não repetir jogos
+    - profile/min_high/sum_target/sum_weight/bucket_weight: passam direto ao GameGenerator
     """
     salt = ""
     if novos:
         # sal temporal + aleatório para mudar a semente e gerar jogos diferentes
         salt = f"-NEW-{dt.datetime.now(TZ).isoformat()}-{_random.randint(0, 1_000_000)}"
     seed = f"MEGASENA-{concurso}-{seed_suffix}{salt}"
-    gen = GameGenerator(seed=seed, display_shuffle=shuffle)
+
+    # perfil padrão por env (sem depender do config.py): SURPRESINHA_PROFILE
+    env_profile = os.getenv("SURPRESINHA_PROFILE", "").strip().lower() or None
+    effective_profile = (profile or env_profile or "historico").lower()
+
+    gen = GameGenerator(
+        seed=seed,
+        display_shuffle=shuffle,
+        profile=effective_profile,
+        min_high=min_high if min_high is not None else 1,
+        sum_target=sum_target,
+        sum_weight=sum_weight,
+        bucket_weight=bucket_weight if bucket_weight is not None else 0.20,
+    )
     return gen.generate(n_games=n_games, balanced=balanced)
 
 def bets_path(concurso: int) -> str:
@@ -548,7 +565,11 @@ async def check_feed_loop():
         msg1 = fmt_resultados_message(ms, prior_bets)
 
         prox_concurso = concurso + 1
-        bets_prox = generate_bets_for_concurso(prox_concurso, seed_suffix=data_prox or "")
+        bets_prox = generate_bets_for_concurso(prox_concurso, seed_suffix=data_prox or "",
+                                               n_games=SETTINGS.surpresinha_default_n,
+                                               balanced=SETTINGS.surpresinha_default_balanced,
+                                               shuffle=SETTINGS.surpresinha_default_shuffle,
+                                               profile=os.getenv("SURPRESINHA_PROFILE", "historico"))
         save_bets(prox_concurso, bets_prox)
         msg2 = fmt_proximo_message(ms, bets_prox)
 
@@ -593,35 +614,94 @@ async def check_feed_loop():
 def _parse_surpresinha_args(args: Tuple[str, ...]) -> Dict[str, Any]:
     """
     Suporta tokens:
-      - 'novos' | '--novos'   -> gera nova semente (jogos diferentes)
-      - 'balanced'            -> modo balanceado
-      - 'n=10' ou '--n' '10'  -> quantidade de jogos
-      - 'shuffle=0|1'         -> exibição embaralhada (1) ou ordenada (0)
+      - 'novos' | '--novos'           -> gera nova semente (jogos diferentes)
+      - 'balanced'                    -> modo balanceado
+      - 'n=10' ou '--n' '10'          -> quantidade de jogos
+      - 'shuffle=0|1'                 -> exibição embaralhada (1) ou ordenada (0)
+      - 'perfil=alto|misto|historico' -> define perfil do gerador (atalhos: 'alto', 'misto', 'historico')
+      - 'min_high=2'                  -> mínimo de dezenas na faixa 41–60
+      - 'sum_target=...'              -> alvo de soma
+      - 'sum_weight=...'              -> peso da penalidade de soma (0 desliga)
+      - 'bucket_weight=...'           -> peso do desvio de buckets
     """
-    cfg = {"novos": False, "balanced": False, "n": 10, "shuffle": True}
+    cfg = {
+        "novos": False,
+        "balanced": SETTINGS.surpresinha_default_balanced,
+        "n": SETTINGS.surpresinha_default_n,
+        "shuffle": SETTINGS.surpresinha_default_shuffle,
+        "profile": None,
+        "min_high": None,
+        "sum_target": None,
+        "sum_weight": None,
+        "bucket_weight": None,
+    }
     args = list(args or [])
+
+    def _as_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    def _as_int(x):
+        try:
+            return int(x)
+        except Exception:
+            return None
 
     i = 0
     while i < len(args):
         tok = str(args[i]).strip().lower()
+
         if tok in ("novos", "--novos", "novo"):
             cfg["novos"] = True
+
         elif tok in ("balanced", "--balanced"):
             cfg["balanced"] = True
+
         elif tok.startswith("n="):
-            try:
-                cfg["n"] = max(1, int(tok.split("=", 1)[1]))
-            except Exception:
-                pass
+            v = _as_int(tok.split("=", 1)[1])
+            if v is not None and v > 0:
+                cfg["n"] = v
         elif tok in ("n", "--n") and i + 1 < len(args):
-            try:
-                cfg["n"] = max(1, int(args[i + 1]))
+            v = _as_int(args[i + 1])
+            if v is not None and v > 0:
+                cfg["n"] = v
                 i += 1
-            except Exception:
-                pass
+
         elif tok.startswith("shuffle="):
             v = tok.split("=", 1)[1]
             cfg["shuffle"] = (v not in ("0", "false", "no"))
+
+        # perfil (com atalho)
+        elif tok in ("alto", "misto", "historico"):
+            cfg["profile"] = tok
+        elif tok.startswith("perfil=") or tok.startswith("profile="):
+            v = tok.split("=", 1)[1]
+            v = v.strip().lower()
+            if v in ("alto", "misto", "historico"):
+                cfg["profile"] = v
+
+        elif tok.startswith("min_high="):
+            v = _as_int(tok.split("=", 1)[1])
+            if v is not None and v >= 0:
+                cfg["min_high"] = v
+
+        elif tok.startswith("sum_target="):
+            v = _as_float(tok.split("=", 1)[1])
+            if v is not None:
+                cfg["sum_target"] = v
+
+        elif tok.startswith("sum_weight="):
+            v = _as_float(tok.split("=", 1)[1])
+            if v is not None and v >= 0:
+                cfg["sum_weight"] = v
+
+        elif tok.startswith("bucket_weight="):
+            v = _as_float(tok.split("=", 1)[1])
+            if v is not None and v >= 0:
+                cfg["bucket_weight"] = v
+
         i += 1
 
     return cfg
@@ -653,13 +733,17 @@ async def cancelar(ctx: commands.Context):
 async def surpresinha(ctx: commands.Context, *args):
     """
     Gera jogos para o próximo concurso.
-    Opções:
-      !surpresinha                     -> 10 jogos padrão (shuffle on)
-      !surpresinha novos               -> gera jogos diferentes (semente nova)
-      !surpresinha balanced            -> cobertura mais uniforme
-      !surpresinha n=15                -> 15 jogos
-      !surpresinha shuffle=0           -> exibição ordenada
-      Combinações são aceitas (ex.: 'novos balanced n=12').
+
+    Exemplos:
+      !surpresinha
+      !surpresinha novos
+      !surpresinha balanced n=12
+      !surpresinha perfil=alto min_high=3
+      !surpresinha perfil=misto sum_target=183 sum_weight=0.1
+      !surpresinha historico bucket_weight=0.15
+
+    Observação: se nada for informado, usamos os defaults do config.py
+    (SURPRESINHA_COUNT, SURPRESINHA_BALANCED, SURPRESINHA_SHUFFLE) e perfil 'historico'.
     """
     opts = _parse_surpresinha_args(args)
 
@@ -688,16 +772,26 @@ async def surpresinha(ctx: commands.Context, *args):
         balanced=opts["balanced"],
         shuffle=opts["shuffle"],
         novos=opts["novos"],
+        profile=opts["profile"],
+        min_high=opts["min_high"],
+        sum_target=opts["sum_target"],
+        sum_weight=opts["sum_weight"],
+        bucket_weight=opts["bucket_weight"],
     )
     save_bets(proximo, bets)
 
+    # Header amigável com flags relevantes
     header = f"Esses são os jogos recomendados para o concurso **{proximo}**"
     flags = []
     if opts["novos"]:
         flags.append("novos")
     if opts["balanced"]:
         flags.append("balanceados")
-    if opts["n"] != 10:
+    if opts["profile"]:
+        flags.append(f"perfil={opts['profile']}")
+    if opts["min_high"] is not None:
+        flags.append(f"min_high={opts['min_high']}")
+    if opts["n"] != SETTINGS.surpresinha_default_n:
         flags.append(f"{opts['n']} jogos")
     if flags:
         header += " (" + ", ".join(flags) + ")"
@@ -757,11 +851,13 @@ async def help_cmd(ctx: commands.Context):
         "**Comandos disponíveis**\n"
         "`!programar [id_do_canal]` – Define onde o bot enviará as mensagens.\n"
         "`!cancelar` – Cancela os envios automáticos neste servidor.\n"
-        "`!surpresinha [novos] [balanced] [n=10] [shuffle=0|1]` – Gera jogos recomendados agora.\n"
+        "`!surpresinha [novos] [balanced] [n=10] [shuffle=0|1] "
+        "[perfil=alto|misto|historico] [min_high=2] [sum_target=...] [sum_weight=...] [bucket_weight=...]` – "
+        "Gera jogos recomendados agora.\n"
         "`!proximo-jogo` – Mostra o número do próximo concurso, data e prêmio estimado.\n"
         "\n**Fluxo automático**\n"
-        "• Mensagem 1: Resultado do concurso e avaliação dos 10 jogos salvos.\n"
-        "• Mensagem 2: 10 jogos para o próximo concurso.\n"
+        "• Mensagem 1: Resultado do concurso e avaliação dos jogos salvos.\n"
+        "• Mensagem 2: Jogos para o próximo concurso.\n"
         "• Mensagem 3: Lembrete no dia do sorteio.\n"
         "\n**Observações técnicas**\n"
         "• Requer **Message Content Intent** habilitado no Developer Portal do Discord.\n"
