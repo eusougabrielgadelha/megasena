@@ -2,6 +2,7 @@ import random
 import itertools as it
 from collections import Counter
 import pandas as pd
+from typing import Optional, Tuple, List
 
 NUMBERS = list(range(1, 61))
 
@@ -21,18 +22,27 @@ def _has_long_sequence(ticket, L=3):
     return False
 
 class GameGenerator:
-    def __init__(self, seed: str = "MEGASENA-SEED", sum_band=(170,215),
-                 min_over31=3, odd_range=(2,4), max_same_decenio=4,
-                 max_same_ending=2, max_mult5=3, max_exposure=4,
-                 pop_size=6000, candidates_per_pick=1200,
-                 display_shuffle=True):
+    def __init__(self,
+                 seed: str = "MEGASENA-SEED",
+                 sum_band: Optional[Tuple[int,int]] = None,   # <- sem trava rígida por padrão
+                 min_over31: int = 3,
+                 min_high: int = 1,                           # <- novo: mínimo em 41–60 por jogo
+                 odd_range: Tuple[int,int] = (2,4),
+                 max_same_decenio: int = 4,
+                 max_same_ending: int = 2,
+                 max_mult5: int = 3,
+                 max_exposure: int = 4,
+                 pop_size: int = 6000,
+                 candidates_per_pick: int = 1200,
+                 display_shuffle: bool = True):
         """
         display_shuffle: se True, embaralha a ordem das dezenas de cada jogo
-                         na SAÍDA (só apresentação), para não "começar baixo".
+                         na SAÍDA (só apresentação), para não “começar baixo”.
         """
         self.rng = random.Random(seed)
-        self.SUM_BAND = sum_band
+        self.SUM_BAND = sum_band          # se None, não aplica filtro rígido de soma
         self.MIN_OVER_31 = min_over31
+        self.MIN_HIGH = min_high          # pelo menos X números em 41–60
         self.ODD_RANGE = odd_range
         self.MAX_SAME_DECENIO = max_same_decenio
         self.MAX_SAME_ENDING = max_same_ending
@@ -42,43 +52,73 @@ class GameGenerator:
         self.CANDIDATES_PER_PICK = candidates_per_pick
         self.DISPLAY_SHUFFLE = display_shuffle
 
-    def _ticket_ok(self, t):
+        # alvo “natural” de soma quando não há banda rígida (média de 1..60 = 30,5; *6 = 183)
+        self._SOFT_SUM_CENTER = 183.0 if self.SUM_BAND is None else (self.SUM_BAND[0] + self.SUM_BAND[1]) / 2.0
+
+    def _ticket_ok(self, t: List[int]) -> bool:
         t = sorted(t)
         s = sum(t)
-        if not (self.SUM_BAND[0] <= s <= self.SUM_BAND[1]):
-            return False
+
+        # (1) Soma – opcionalmente rígida
+        if self.SUM_BAND is not None:
+            if not (self.SUM_BAND[0] <= s <= self.SUM_BAND[1]):
+                return False
+
+        # (2) Composição básica
         if sum(1 for x in t if x > 31) < self.MIN_OVER_31:
             return False
+
+        # (3) Exigir presença de altos (41–60)
+        if self.MIN_HIGH > 0 and sum(1 for x in t if x >= 41) < self.MIN_HIGH:
+            return False
+
+        # (4) Paridade
         odds = sum(1 for x in t if x % 2 == 1)
         if not (self.ODD_RANGE[0] <= odds <= self.ODD_RANGE[1]):
             return False
+
+        # (5) Concentração por decênio e finais
         dec_counts = Counter(_decenio(x) for x in t)
         if any(c > self.MAX_SAME_DECENIO for c in dec_counts.values()):
             return False
+
         end_counts = Counter(x % 10 for x in t)
         if any(c > self.MAX_SAME_ENDING for c in end_counts.values()):
             return False
+
+        # (6) Múltiplos de 5 excessivos
         if sum(1 for x in t if x % 5 == 0) > self.MAX_MULT_5:
             return False
+
+        # (7) Evitar sequências longas
         if _has_long_sequence(t, 3):
             return False
+
         return True
 
-    def _anti_popularity_penalty(self, t):
+    def _anti_popularity_penalty(self, t: List[int]) -> float:
         t = sorted(t)
         pen = 0.0
-        # prefere menos números <=31 (evita "datas")
-        low = sum(1 for x in t if x <= 31)
-        pen += max(0, low - 2) * 0.8
-        # aproxima soma do centro do intervalo
-        center = (self.SUM_BAND[0] + self.SUM_BAND[1]) / 2.0
-        pen += abs(sum(t) - center) / 50.0
-        # evita finais repetidos e concentração por decênios
+
+        # (A) “Datas”/muitos baixos: 1–20
+        low20 = sum(1 for x in t if x <= 20)
+        pen += max(0, low20 - 2) * 0.6
+
+        # (B) Poucos altos: incentivar ter altos (41–60)
+        high = sum(1 for x in t if x >= 41)
+        pen += max(0, 2 - high) * 0.7    # empurra a ter pelo menos 2 altos (suave)
+
+        # (C) Soma – penalidade suave ao redor do centro
+        pen += abs(sum(t) - self._SOFT_SUM_CENTER) / 60.0
+
+        # (D) Finais repetidos e concentração por decênios
         end_counts = Counter(x % 10 for x in t)
         pen += sum(max(0, c - 1) for c in end_counts.values()) * 0.3
+
         dec_counts = Counter(_decenio(x) for x in t)
         pen += sum(max(0, c - 2) for c in dec_counts.values()) * 0.4
-        # evita múltiplos de 5 em excesso
+
+        # (E) Múltiplos de 5 excessivos
         pen += max(0, sum(1 for x in t if x % 5 == 0) - 2) * 0.5
         return pen
 
@@ -103,35 +143,32 @@ class GameGenerator:
         self.rng.shuffle(l)
         return l
 
-    def generate(self, n_games=10, balanced=False):
+    def generate(self, n_games: int = 10, balanced: bool = False):
         """
         Gera n_games jogos.
         - balanced=True: tenta limitar a exposição de cada dezena a 1x quando possível
                          (especialmente válido quando n_games*6 <= 60).
-        Retorna uma lista de listas com dezenas **EMBARALHADAS** para exibição
-        (se display_shuffle=True). Para guardar/cotejar, ordene externamente se quiser.
+        Saída vem **embaralhada** para exibição (se display_shuffle=True).
         """
-        # 1) gera candidatos válidos
+        # 1) Gera candidatos válidos
         candidates = set()
         tries = 0
-        while len(candidates) < self.POP_SIZE and tries < self.POP_SIZE * 50:
+        max_tries = self.POP_SIZE * 50
+        while len(candidates) < self.POP_SIZE and tries < max_tries:
             tries += 1
             t = tuple(sorted(self.rng.sample(NUMBERS, 6)))
             if self._ticket_ok(t):
                 candidates.add(t)
         candidates = list(candidates)
 
-        # 2) seleção gulosa com cobertura de pares/trincas
+        # 2) Seleção gulosa com cobertura de pares/trincas
         selected = []
         covered_pairs = set()
         covered_triples = set()
         exposure = Counter()
 
         # Limite local de exposição (modo balanceado tenta 1x por número)
-        if balanced and n_games * 6 <= len(NUMBERS):
-            local_max_exp = 1
-        else:
-            local_max_exp = self.MAX_EXPOSURE
+        local_max_exp = 1 if (balanced and n_games * 6 <= len(NUMBERS)) else self.MAX_EXPOSURE
 
         def feasible(t):
             return all(exposure[x] < local_max_exp for x in t)
@@ -141,7 +178,6 @@ class GameGenerator:
             tr_new = len(self._triples_of(t) - covered_triples)
             overlap_pen = sum(self._jaccard(t, s) for s in selected)
             ap_pen = self._anti_popularity_penalty(t)
-            # penaliza repetir dezenas já expostas
             exp_pen = sum((exposure[x] / max(1, local_max_exp)) for x in t) * 0.3
             return (3.0 * p_new) + (1.5 * tr_new) - (2.5 * overlap_pen) - (1.8 * ap_pen) - exp_pen
 
@@ -168,7 +204,6 @@ class GameGenerator:
                         best_score, best = sc, t
 
             if best is None:
-                # sem candidatos nem no fallback
                 break
 
             selected.append(best)
@@ -177,8 +212,7 @@ class GameGenerator:
             for x in best:
                 exposure[x] += 1
 
-        # Se não conseguiu preencher tudo (modo balanceado pode ficar "apertado"),
-        # completa com o melhor possível ignorando balanced.
+        # Completa se necessário (ignora balanced para preencher)
         while len(selected) < n_games and candidates:
             pool_size = min(self.CANDIDATES_PER_PICK, len(candidates))
             pool = self.rng.sample(candidates, pool_size)
@@ -196,10 +230,9 @@ class GameGenerator:
             covered_pairs |= self._pairs_of(best)
             covered_triples |= self._triples_of(best)
 
-        # 3) saída: embaralhada para apresentação (não "começar baixo")
+        # 3) Saída: embaralhada para apresentação (não “começar baixo”)
         if self.DISPLAY_SHUFFLE:
             return [self._shuffle_for_display(t) for t in selected]
-        # Se quiser manter ordenado na saída, troque a flag no __init__ ou ajuste aqui:
         return [sorted(list(t)) for t in selected]
 
 def load_history_numbers_from_excel(path: str) -> pd.DataFrame:
