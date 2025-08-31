@@ -18,7 +18,7 @@ Fluxo automático:
 Comandos:
 !programar [id_do_canal]
 !cancelar
-!surpresinha
+!surpresinha [novos] [balanced] [n=10] [shuffle=0|1]
 !proximo-jogo
 !help
 
@@ -80,14 +80,12 @@ DEFAULT_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Dest": "empty",
 }
-# Opcional: permitir cookies customizados via variável de ambiente (se necessário)
-# Ex.: export CAIXA_COOKIE="JSESSIONID=...; outra=..."
 _env_cookie = os.environ.get("CAIXA_COOKIE")
 if _env_cookie:
     DEFAULT_HEADERS["Cookie"] = _env_cookie
 
 # Endpoints
-ALT_API_URL = "https://loteriascaixa-api.herokuapp.com/api/megasena/latest"  # nova API principal
+ALT_API_URL = "https://loteriascaixa-api.herokuapp.com/api/megasena/latest"
 HOME_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/home/ultimos-resultados"
 MODALIDADE_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/megasena"
 SCRAPE_URL = "https://loterias.caixa.gov.br/wps/portal/loterias/landing/megasena"
@@ -187,16 +185,6 @@ def _normalize_modalidade(ms2: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _normalize_alt_api(js: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normaliza a resposta de https://loteriascaixa-api.herokuapp.com/api/megasena/latest
-    Exemplo de campos:
-      - concurso (int), data (DD/MM/AAAA)
-      - dezenas (lista de strings), dezenasOrdemSorteio
-      - acumulou (bool)
-      - proximoConcurso (int), dataProximoConcurso (DD/MM/AAAA)
-      - premiacoes: [{faixa:1, ganhadores:int, valorPremio:float}, ...]
-      - valorEstimadoProximoConcurso (float)
-    """
     dezenas_strs = js.get("dezenas") or []
     dezenas = [int(x) for x in dezenas_strs if str(x).isdigit()]
     dezenas = sorted(dezenas)
@@ -206,7 +194,6 @@ def _normalize_alt_api(js: Dict[str, Any]) -> Dict[str, Any]:
     acumulou = bool(js.get("acumulou", False))
     valor_estimado = float(js.get("valorEstimadoProximoConcurso") or 0.0)
 
-    # faixa 1 = sena
     qtd_ganh = 0
     valor_premio = 0.0
     for pr in js.get("premiacoes", []):
@@ -343,18 +330,15 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
       4) Scraping do site oficial
       5) Cache local
     """
-    # 1) Heroku API (menos sujeita a 403 e já normalizada)
     try:
         js = await _fetch_json(session, ALT_API_URL, headers={"Accept": "application/json", "User-Agent": DEFAULT_HEADERS["User-Agent"]})
         out = _normalize_alt_api(js)
-        # Só salva se tiver base mínima
         if out.get("numeroDoConcurso") or out.get("dezenas"):
             _save_last_good(out)
         return out
     except Exception as e:
         log(f"[WARN] ALT_API falhou: {e}")
 
-    # 2) HOME oficial
     try:
         home = await _fetch_json(session, HOME_URL)
         ms = home.get("megasena") or home.get("megaSena") or {}
@@ -365,7 +349,6 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     except Exception as e:
         log(f"[WARN] HOME falhou: {e}")
 
-    # 3) Modalidade oficial
     try:
         ms2 = await _fetch_json(session, MODALIDADE_URL)
         out = _normalize_modalidade(ms2)
@@ -374,7 +357,6 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     except Exception as e:
         log(f"[WARN] MODALIDADE falhou: {e}")
 
-    # 4) Scraping
     try:
         out = await fetch_via_scrape(session)
         if (out.get("numeroDoConcurso") is not None) or out.get("dezenas"):
@@ -383,7 +365,6 @@ async def fetch_megasena(session: aiohttp.ClientSession) -> Dict[str, Any]:
     except Exception as e:
         log(f"[WARN] SCRAPE falhou: {e}")
 
-    # 5) Cache local
     cached = _load_last_good()
     if cached:
         log("[INFO] usando cache local (stale)")
@@ -406,10 +387,29 @@ def load_history_df():
 
 HISTORY_DF = load_history_df()
 
-def generate_bets_for_concurso(concurso: int, seed_suffix: str = "") -> List[List[int]]:
-    seed = f"MEGASENA-{concurso}-{seed_suffix}"
-    gen = GameGenerator(seed=seed)
-    return gen.generate(n_games=10)
+def generate_bets_for_concurso(
+    concurso: int,
+    seed_suffix: str = "",
+    *,
+    n_games: int = 10,
+    balanced: bool = False,
+    shuffle: bool = True,
+    novos: bool = False
+) -> List[List[int]]:
+    """
+    Gera apostas para um concurso.
+    - n_games: quantidade de jogos
+    - balanced: tenta cobertura uniforme (quando possível)
+    - shuffle: embaralha a ordem de apresentação das dezenas
+    - novos: se True, usa um 'sal' temporal aleatório para não repetir jogos
+    """
+    salt = ""
+    if novos:
+        # sal temporal + aleatório para mudar a semente e gerar jogos diferentes
+        salt = f"-NEW-{dt.datetime.now(TZ).isoformat()}-{_random.randint(0, 1_000_000)}"
+    seed = f"MEGASENA-{concurso}-{seed_suffix}{salt}"
+    gen = GameGenerator(seed=seed, display_shuffle=shuffle)
+    return gen.generate(n_games=n_games, balanced=balanced)
 
 def bets_path(concurso: int) -> str:
     return os.path.join(DATA_DIR, f"bets_{concurso}.json")
@@ -436,10 +436,15 @@ def eval_hits(drawn: List[int], bets: List[List[int]]) -> Tuple[List[int], Optio
     best_index = hits_per_game.index(max_hits) + 1 if hits_per_game else None
     return hits_per_game, best_index, max_hits
 
-def fmt_games(bets: List[List[int]]) -> str:
+def fmt_games(bets: List[List[int]], *, sort_output: bool = False) -> str:
+    """
+    sort_output=False (padrão): mantém a ordem recebida, que já vem embaralhada
+    pelo GameGenerator (display_shuffle=True), evitando a impressão de "começar baixo".
+    """
     lines = []
     for i, b in enumerate(bets, 1):
-        nums = " - ".join(f"{n:02d}" for n in sorted(b))
+        seq = sorted(b) if sort_output else b
+        nums = " - ".join(f"{n:02d}" for n in seq)
         lines.append(f"- Jogo {i}: {nums}")
     return "\n".join(lines)
 
@@ -582,6 +587,46 @@ async def check_feed_loop():
         log(f"[WARN] lembrete: {e}")
 
 # -----------------------------------------------------------------------------
+# Helpers de parsing
+# -----------------------------------------------------------------------------
+
+def _parse_surpresinha_args(args: Tuple[str, ...]) -> Dict[str, Any]:
+    """
+    Suporta tokens:
+      - 'novos' | '--novos'   -> gera nova semente (jogos diferentes)
+      - 'balanced'            -> modo balanceado
+      - 'n=10' ou '--n' '10'  -> quantidade de jogos
+      - 'shuffle=0|1'         -> exibição embaralhada (1) ou ordenada (0)
+    """
+    cfg = {"novos": False, "balanced": False, "n": 10, "shuffle": True}
+    args = list(args or [])
+
+    i = 0
+    while i < len(args):
+        tok = str(args[i]).strip().lower()
+        if tok in ("novos", "--novos", "novo"):
+            cfg["novos"] = True
+        elif tok in ("balanced", "--balanced"):
+            cfg["balanced"] = True
+        elif tok.startswith("n="):
+            try:
+                cfg["n"] = max(1, int(tok.split("=", 1)[1]))
+            except Exception:
+                pass
+        elif tok in ("n", "--n") and i + 1 < len(args):
+            try:
+                cfg["n"] = max(1, int(args[i + 1]))
+                i += 1
+            except Exception:
+                pass
+        elif tok.startswith("shuffle="):
+            v = tok.split("=", 1)[1]
+            cfg["shuffle"] = (v not in ("0", "false", "no"))
+        i += 1
+
+    return cfg
+
+# -----------------------------------------------------------------------------
 # Comandos
 # -----------------------------------------------------------------------------
 
@@ -605,11 +650,19 @@ async def cancelar(ctx: commands.Context):
         await ctx.reply("Nada para cancelar aqui.")
 
 @bot.command(name="surpresinha")
-async def surpresinha(ctx: commands.Context):
+async def surpresinha(ctx: commands.Context, *args):
     """
-    Gera 10 jogos do próximo concurso.
-    Se a consulta falhar por completo, usa fallback local (último concurso processado + data atual como semente).
+    Gera jogos para o próximo concurso.
+    Opções:
+      !surpresinha                     -> 10 jogos padrão (shuffle on)
+      !surpresinha novos               -> gera jogos diferentes (semente nova)
+      !surpresinha balanced            -> cobertura mais uniforme
+      !surpresinha n=15                -> 15 jogos
+      !surpresinha shuffle=0           -> exibição ordenada
+      Combinações são aceitas (ex.: 'novos balanced n=12').
     """
+    opts = _parse_surpresinha_args(args)
+
     ms = None
     api_err = None
     try:
@@ -628,11 +681,29 @@ async def surpresinha(ctx: commands.Context):
         proximo = (last + 1) if last else 0
         seed_suffix = dt.datetime.now(TZ).strftime("%Y-%m-%d")
 
-    bets = generate_bets_for_concurso(proximo, seed_suffix=seed_suffix)
+    bets = generate_bets_for_concurso(
+        proximo,
+        seed_suffix=seed_suffix,
+        n_games=opts["n"],
+        balanced=opts["balanced"],
+        shuffle=opts["shuffle"],
+        novos=opts["novos"],
+    )
     save_bets(proximo, bets)
 
-    header = f"Esses são os jogos recomendados para o concurso **{proximo}**:\n"
-    body = fmt_games(bets)
+    header = f"Esses são os jogos recomendados para o concurso **{proximo}**"
+    flags = []
+    if opts["novos"]:
+        flags.append("novos")
+    if opts["balanced"]:
+        flags.append("balanceados")
+    if opts["n"] != 10:
+        flags.append(f"{opts['n']} jogos")
+    if flags:
+        header += " (" + ", ".join(flags) + ")"
+    header += ":\n"
+
+    body = fmt_games(bets, sort_output=not opts["shuffle"])
     note = ""
     if api_err:
         note = (
@@ -686,7 +757,7 @@ async def help_cmd(ctx: commands.Context):
         "**Comandos disponíveis**\n"
         "`!programar [id_do_canal]` – Define onde o bot enviará as mensagens.\n"
         "`!cancelar` – Cancela os envios automáticos neste servidor.\n"
-        "`!surpresinha` – Gera 10 jogos recomendados agora.\n"
+        "`!surpresinha [novos] [balanced] [n=10] [shuffle=0|1]` – Gera jogos recomendados agora.\n"
         "`!proximo-jogo` – Mostra o número do próximo concurso, data e prêmio estimado.\n"
         "\n**Fluxo automático**\n"
         "• Mensagem 1: Resultado do concurso e avaliação dos 10 jogos salvos.\n"
